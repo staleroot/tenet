@@ -1,7 +1,26 @@
 import bisect
 import collections
-import idaapi
-from tenet.util.log import pmsg
+
+#
+# the analysis layer is mostly disassembler agnostic: only the legacy ASLR
+# heuristic needs an imagebase, and it can take it from the context API.
+# tolerate a missing disassembler so traces can be analyzed head-less.
+#
+
+try:
+    import idaapi
+except ImportError:  # pragma: no cover - outside of IDA
+    idaapi = None
+
+try:
+    from tenet.util.log import pmsg, pdbg
+except Exception:  # pragma: no cover - outside of IDA
+    pmsg = print
+
+    def pdbg(fmt, *args):
+        print("debug: %s" % (fmt % args if args else fmt))
+
+from tenet.trace.addressing import OffsetResolver, Resolution, identify_image
 
 #-----------------------------------------------------------------------------
 # analysis.py -- Trace Analysis
@@ -30,7 +49,136 @@ class TraceAnalysis(object):
         self._remapped_regions = []
         self._unmapped_entry_points = []
         self.slide = None
+
+        #
+        # FRINET: where `off == 0` lives in the database (see addressing.py).
+        # None until -- and unless -- the offset origin could be resolved.
+        #
+        self.offset_resolution = None
+
         self._analyze()
+
+    #-------------------------------------------------------------------------
+    # FRINET offset mapping
+    #-------------------------------------------------------------------------
+
+    @property
+    def offset_origin(self):
+        """
+        Return ``idb_module_start`` (the address of ``off == 0``), or None.
+        """
+        resolution = self.offset_resolution
+        if resolution is None:
+            return None
+        return resolution.origin
+
+    def translate_offset(self, off):
+        """
+        Return ``static_ea = idb_module_start + off`` for the given offset.
+
+        Returns None when the origin is unknown: callers must then fall
+        back to the legacy ASLR translation (or not navigate at all).
+        """
+        if self.offset_resolution is None:
+            return None
+        return self.offset_resolution.to_ea(off)
+
+    def _analyze_offsets(self):
+        """
+        Resolve where the traced module lives in the open database.
+        """
+        trace = self._trace
+
+        #
+        # this early return is silent, and it is the one that decides whether
+        # the offset is used at all -- so say so, loudly, when it happens
+        #
+        if not getattr(trace, "has_offsets", False):
+            pdbg("offsets: this trace carries no off= fields (a legacy .tenet, "
+                 "or every event fell outside the traced module)")
+            pdbg("offsets: navigation will use the legacy ASLR heuristic only")
+            return
+
+        dctx = self._dctx
+        if dctx is None:
+            pdbg("offsets: no disassembler context, cannot resolve origin")
+            return Resolution(None, None, [], False, "no-disassembler")
+
+        try:
+            segments = dctx.get_segments()
+            samples = trace.sample_offsets()
+            identity = identify_image(
+                getattr(trace, "filepath", None),
+                dctx.get_root_filename() if hasattr(dctx, "get_root_filename") else None,
+            )
+
+            pdbg("offsets: %d db segments, imagebase=%s, %d sampled offsets",
+                 len(segments or []), self._get_imagebase(), len(samples or []))
+            pdbg("offsets: trace image %r vs database image %r",
+                 getattr(identity, "trace_image", None),
+                 getattr(identity, "db_image", None))
+
+            resolver = OffsetResolver(
+                segments=segments,
+                sample_offs=samples,
+                imagebase=dctx.get_imagebase() if hasattr(dctx, "get_imagebase") else None,
+                identity=identity,
+                is_mapped=getattr(dctx, "is_mapped", None),
+                is_code=getattr(dctx, "is_code_address", None),
+                prompt=getattr(dctx, "confirm_offset_origin", None),
+            )
+            resolution = resolver.resolve()
+
+        except Exception as exc:
+            pdbg("offsets: resolver raised %s: %s", type(exc).__name__, exc)
+            resolution = Resolution(None, None, [], False, f"error: {exc}")
+
+        self.offset_resolution = resolution
+        pdbg("offsets: resolved to %r", resolution)
+
+        if resolution.resolved:
+            pmsg(f"FRINET offset origin: 0x{resolution.origin:X} ({resolution.source}, {resolution.reason})")
+
+            #
+            # a name mismatch that we overrode is the one case where the
+            # user should know we made a judgement call on their behalf
+            #
+            if resolution.reason == "image-mismatch-overridden":
+                identity = resolution.identity
+                pmsg(" +-------------------------------------------------------------")
+                pmsg(" |- WARNING: the trace image name does not match this database:")
+                pmsg(f" |     trace  : {identity.trace_image}")
+                pmsg(f" |     database: {identity.db_image}")
+                pmsg(" |")
+                pmsg(" |   Mapping was accepted anyway because every sampled offset")
+                pmsg(" |   landed in the database (overwhelming structural evidence).")
+                pmsg(" |   If navigation lands in the wrong place, reload the trace")
+                pmsg(" |   against the matching binary.")
+                pmsg(" +-+-----------------------------------------------------------")
+        else:
+            pmsg(f"FRINET offset origin unresolved ({resolution.reason}); using legacy ASLR translation.")
+
+        return resolution
+
+    def _get_imagebase(self):
+        """Best-effort imagebase: context API first, idaapi as a fallback."""
+        dctx = self._dctx
+        if dctx is not None and hasattr(dctx, "get_imagebase"):
+            return dctx.get_imagebase()
+        if idaapi is not None:
+            return idaapi.get_imagebase()
+        return 0
+
+    def _is_mapped(self, address):
+        """Tri-state mapped check: True / False, or None when unknown."""
+        dctx = self._dctx
+        checker = getattr(dctx, "is_mapped", None) if dctx is not None else None
+        if checker is None:
+            return None
+        try:
+            return bool(checker(address))
+        except Exception:
+            return None
 
     #-------------------------------------------------------------------------
     # Public
@@ -39,7 +187,16 @@ class TraceAnalysis(object):
     def rebase_pointer(self, address):
         """
         Return a rebased version of the given address, if one exists.
+
+        FRINET first: when the offset origin is known, trace addresses are
+        translated with ``idb_module_start + (pc - slide)`` and database
+        addresses back to the trace with the inverse. The legacy ASLR
+        region heuristic stays as the fallback.
         """
+        translated = self._rebase_via_offset(address)
+        if translated is not None:
+            return translated
+
         for m1, m2 in self._remapped_regions:
             #print(f"m1 start: {m1[0]:08X} address: {address:08X} m1 end: {m1[1]:08X}")
             #print(f"m2 start: {m2[0]:08X} address: {address:08X} m2 end: {m2[1]:08X}")
@@ -48,6 +205,35 @@ class TraceAnalysis(object):
             if m2[0] <= address <= m2[1]:
                return address - (m2[0] - m1[0])
         return address
+
+    def _rebase_via_offset(self, address):
+        """
+        Translate through the resolved offset origin (or None to fall back).
+        """
+        origin = self.offset_origin
+        slide = self._trace.slide
+
+        if origin is None or slide is None:
+            return None
+
+        #
+        # a runtime address of the traced module: static_ea = origin + off
+        #
+        if address >= slide:
+            static_ea = origin + (address - slide)
+            if self._is_mapped(static_ea) is False:
+                # the database does not contain this address: let the legacy
+                # translation decide instead of pointing at nothing
+                return None
+            return static_ea
+
+        #
+        # a database address: off = address - origin, pc = slide + off
+        #
+        if self._is_mapped(address) is not True:
+            return None
+
+        return slide + (address - origin)
 
     def get_prev_mapped_idx(self, idx):
         """
@@ -67,6 +253,9 @@ class TraceAnalysis(object):
         """
         Analyze the trace against the binary loaded by the disassembler.
         """
+        # FRINET: resolve `off == 0` first, the legacy ASLR math below can
+        # then use it as the image origin when the nominal imagebase lies.
+        self._analyze_offsets()
         self._analyze_aslr()
         self._analyze_unmapped()
 
@@ -130,7 +319,16 @@ class TraceAnalysis(object):
         instruction_addresses = set(instruction_addresses)
 
         if self._trace.slide is not None:
-            slide = self._trace.slide-idaapi.get_imagebase()
+            #
+            # FRINET: prefer the resolved module origin over the nominal
+            # imagebase -- for ELF/Android databases they are not always
+            # the same address, and using the wrong one shifts the whole
+            # trace by the difference.
+            #
+            origin = self.offset_origin
+            if origin is None:
+                origin = self._get_imagebase()
+            slide = self._trace.slide - origin
             print(f"ASLR Slide: {slide:#x} from trace")
         else:
             #

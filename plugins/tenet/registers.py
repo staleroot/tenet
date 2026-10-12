@@ -2,6 +2,16 @@ from tenet.ui import *
 from tenet.util.misc import register_callback, notify_callback
 from tenet.integration.api import DockableWindow, disassembler
 
+#
+# clipboard access is only meaningful with a UI; guarded so this module can
+# still be imported head-less (eg, by the unit tests)
+#
+if QT_AVAILABLE:
+    from tenet.util.qt.util import copy_to_clipboard
+else:
+    def copy_to_clipboard(data):
+        raise RuntimeError("no Qt binding available for clipboard access")
+
 #------------------------------------------------------------------------------
 # registers.py -- Register Controller
 #------------------------------------------------------------------------------
@@ -162,6 +172,33 @@ class RegisterController(object):
         """
         self.model.set_registers(registers, delta)
 
+    def toggle_display_format(self):
+        """
+        Toggle the register value rendering between hexadecimal and decimal.
+        """
+        self.model.display_decimal = not self.model.display_decimal
+        if self.view:
+            self.view.refresh()
+        return self.model.display_decimal
+
+    def copy_register_value(self, reg_name):
+        """
+        Copy a register's rendered value to the clipboard.
+
+        Returns False when the register is unavailable at this trace
+        position (nothing is copied in that case: an absent register must
+        never masquerade as a zero).
+        """
+        if reg_name not in self.model.registers:
+            return False
+
+        reg_value = self.model.registers[reg_name]
+        if reg_value is None:
+            return False
+
+        copy_to_clipboard(self.model.render_value(reg_value))
+        return True
+
     def evaluate_expression(self, expression):
         """
         Evaluate the expression in the IDX Shell and navigate to it.
@@ -262,21 +299,6 @@ class RegisterController(object):
             return
         self.view.refresh()
 
-    def _idx_changed(self, idx):
-        """
-        The trace position has been changed.
-        """
-        self.model.idx = idx
-        self.set_registers(self.reader.registers, self.reader.trace.get_reg_delta(idx).keys())
-
-    def _breakpoints_changed(self):
-        """
-        Handle breakpoints changed event.
-        """
-        if not self.view:
-            return
-        self.view.refresh()
-
 class RegistersModel(object):
     """
     The Registers Model (Data)
@@ -345,6 +367,33 @@ class RegistersModel(object):
 
         self.focused_reg_name = None
         self.focused_reg_value = None
+
+        #
+        # how register values are rendered: hexadecimal by default, with a
+        # decimal toggle in the view's context menu. Note that this only
+        # affects *display* -- the underlying values stay integers.
+        #
+        self.display_decimal = False
+
+    def render_value(self, value):
+        """
+        Render one register value in the currently selected base.
+
+        An unavailable (None) register renders as a field of '?' so it can
+        never be mistaken for a legitimate zero.
+        """
+        if value is None:
+            return "?" * (self.arch.POINTER_SIZE * 2)
+
+        if self.display_decimal:
+            # signed rendering, since registers are frequently pointers or
+            # negative offsets and raw unsigned decimal is hard to read
+            signed = value - (1 << (self.arch.POINTER_SIZE * 8))
+            if signed < 0:
+                return str(signed)
+            return str(value)
+
+        return "%0*X" % (self.arch.POINTER_SIZE * 2, value)
 
     def set_registers(self, registers, delta=None):
 

@@ -3,13 +3,24 @@ import logging
 import traceback
 
 from tenet.util.qt import *
-from tenet.util.log import pmsg
+from tenet.util.log import pmsg, pdbg
 from tenet.util.misc import is_plugin_dev
+
+#
+# the scheduler that drives pseudocode updates. imported explicitly (rather
+# than picked out of the star import) so its absence is a named condition
+# with a readable message, not a NameError from three frames away.
+#
+try:
+    from tenet.util.qt.util import QTimerScheduler
+except Exception:
+    QTimerScheduler = None
 
 from tenet.stack import StackController
 from tenet.memory import MemoryController
 from tenet.registers import RegisterController
 from tenet.breakpoints import BreakpointController
+from tenet.event_info import EventInfoController
 from tenet.ui.trace_view import TraceDock
 from tenet.ui.tree_view import TreeDock
 
@@ -17,6 +28,25 @@ from tenet.types import BreakpointType
 from tenet.trace.arch import ArchAMD64, ArchX86, ArchARM, ArchARM64
 from tenet.trace.reader import TraceReader
 from tenet.integration.api import disassembler, DisassemblerContextAPI
+
+#
+# the pseudocode synchronisation layer. imported lazily / defensively: it is
+# only meaningful inside a disassembler that has Hex-Rays, and the plugin
+# must still load (and the trace still be browsable) without it.
+#
+try:
+    from tenet.sync import PseudocodeSyncController
+except Exception:
+    PseudocodeSyncController = None
+
+#
+# navigation aids (history / bookmarks / occurrence index). pure python, but
+# imported defensively for the same reason as above.
+#
+try:
+    from tenet.sync.navigation import Bookmarks, History, OccurrenceIndex
+except Exception:
+    Bookmarks = History = OccurrenceIndex = None
 
 logger = logging.getLogger("Tenet.Context")
 NMEM = 4
@@ -85,6 +115,70 @@ class TenetContext(object):
         self.stack = StackController(self)
         self.memories = [MemoryController(self, i+1) for i in range(NMEM)]
         self.registers = RegisterController(self)
+        self.event_info = EventInfoController(self)
+
+        #
+        # the pseudocode synchronisation controller. created up front (so it
+        # survives trace replacement) but only *attached* to a reader once a
+        # trace is loaded. it is inert without Hex-Rays.
+        #
+        if PseudocodeSyncController:
+            try:
+                from tenet.sync import hexrays_api as _hexrays_api
+
+                #
+                # the scheduler is not optional, and passing it is not a
+                # detail: without one the controller queues updates that
+                # nothing ever runs, and the pseudocode silently never
+                # follows the trace while everything else appears to work.
+                # QTimerScheduler restarts a single-shot timer on each index
+                # change, so a fast scrub collapses into one decompile
+                # rather than one per step.
+                #
+                if QTimerScheduler is None:
+                    raise RuntimeError(
+                        "no Qt binding resolved, so there is nothing to "
+                        "schedule pseudocode updates with")
+
+                #
+                # auto-open is the switch for the one genuinely debatable
+                # behaviour here: whether sync may obtain a pseudocode view
+                # that is not already showing the traced function. On by
+                # default because declining is what made the feature look
+                # switched off; TENET_NO_PSEUDOCODE_OPEN restores "never
+                # touch a window that is not already on the right function".
+                #
+                auto_open = not os.environ.get("TENET_NO_PSEUDOCODE_OPEN")
+
+                scheduler = QTimerScheduler()
+                self.sync = PseudocodeSyncController(
+                    _hexrays_api, scheduler=scheduler, auto_open=auto_open)
+                pdbg("pseudocode sync controller created (scheduler=%s, "
+                     "auto_open=%s)", type(scheduler).__name__, auto_open)
+            except Exception as exc:
+                logger.debug("pseudocode sync unavailable", exc_info=True)
+                pdbg("pseudocode sync unavailable: %s: %s", type(exc).__name__, exc)
+                self.sync = None
+        else:
+            pdbg("pseudocode sync unavailable: tenet.sync did not import")
+            self.sync = None
+
+        if self.sync:
+            self.event_info.set_sync(self.sync)
+
+        #
+        # secondary navigation state. the occurrence index is built lazily
+        # (once) on first use, since it is a full pass over the trace
+        #
+        self.history = History() if History else None
+        self.bookmarks = Bookmarks() if Bookmarks else None
+        self._occurrence_index = None
+
+        #
+        # set while walking the history, so the seek it performs is not
+        # recorded as a fresh visit (that would wipe the forward stack)
+        #
+        self._suppress_history = False
 
         # the directory to start the 'load trace file' dialog in
         self._last_directory = None
@@ -124,6 +218,38 @@ class TenetContext(object):
     @property
     def palette(self):
         return self.core.palette
+
+    @property
+    def occurrence_index(self):
+        """
+        Return the (lazily built) occurrence index for the loaded trace.
+
+        Built on first use: it is a single pass over every event, which is
+        too much work to do eagerly for a trace the user may never navigate
+        with 'next occurrence' at all.
+        """
+        if self._occurrence_index is None:
+            if not (self.reader and OccurrenceIndex):
+                return None
+
+            #
+            # the wait box asserts a Qt runtime, so it is only used when one
+            # is actually present (the index build itself is head-less safe)
+            #
+            qt = QT_AVAILABLE
+            try:
+                if qt:
+                    disassembler.show_wait_box("Indexing trace...")
+                self._occurrence_index = OccurrenceIndex.build(self.reader)
+            except Exception:
+                pmsg("Failed to build trace occurrence index...")
+                pmsg(traceback.format_exc())
+                self._occurrence_index = None
+            finally:
+                if qt:
+                    disassembler.hide_wait_box()
+
+        return self._occurrence_index
     
     #-------------------------------------------------------------------------
     # Setup / Teardown
@@ -192,6 +318,16 @@ class TenetContext(object):
             pmsg("   |  predicting an ASLR slide.")
 
         #
+        # the two facts that decide how every address in this trace will be
+        # mapped into the database, printed together so a single log line
+        # answers "why is nothing highlighting?"
+        #
+        pdbg("trace: arch=%s has_offsets=%s slide=%s",
+             getattr(self.reader.trace, "arch", None),
+             getattr(self.reader.trace, "has_offsets", False),
+             self.reader.analysis.slide and f"{self.reader.analysis.slide:#x}")
+
+        #
         # we only hook directly into the disassembler / UI / subsytems once
         # a trace is loaded. this ensures that our python handlers don't
         # introduce overhead on misc disassembler callbacks when the plugin
@@ -212,12 +348,42 @@ class TenetContext(object):
         for i in range(NMEM):
             self.memories[i].attach_reader(self.reader)
         self.registers.attach_reader(self.reader)
+        self.event_info.attach_reader(self.reader)
+
+        #
+        # attach the pseudocode synchronisation (no-op without Hex-Rays).
+        # deliberately after the reader is fully wired so the first idx
+        # change it sees is a complete one
+        #
+        if self.sync:
+            try:
+                self.sync.attach_reader(self.reader)
+                try:
+                    hexrays_available = self.sync.hexrays.is_available()
+                except Exception:
+                    hexrays_available = "unknown"
+                pdbg("pseudocode sync attached (hex-rays available=%s)",
+                     hexrays_available)
+            except Exception as exc:
+                logger.debug("pseudocode sync attach failed", exc_info=True)
+                pdbg("pseudocode sync attach failed: %s: %s",
+                     type(exc).__name__, exc)
+        else:
+            pdbg("no pseudocode sync controller to attach")
 
         #
         # connect any high level signals from the new trace reader
         #
 
         self.reader.idx_changed(self._idx_changed)
+        pdbg("disassembly tracking wired to reader idx changes")
+
+        # forget any navigation state belonging to the previous trace
+        if self.history:
+            self.history.reset()
+        if self.bookmarks:
+            self.bookmarks.clear()
+        self._occurrence_index = None
 
     def close_trace(self):
         """
@@ -234,6 +400,17 @@ class TenetContext(object):
         self.core.unhook()
 
         #
+        # stop the pseudocode synchronisation first: it holds caches and a
+        # pending scheduled update that reference the reader we are about
+        # to discard
+        #
+        if self.sync:
+            try:
+                self.sync.detach_reader()
+            except Exception:
+                logger.debug("pseudocode sync detach failed", exc_info=True)
+
+        #
         # close UI elements and reset their model / controllers
         #
 
@@ -248,10 +425,24 @@ class TenetContext(object):
             self.memories[i].detach_reader()
         self.registers.hide()
         self.registers.detach_reader()
+        self.event_info.hide()
+        self.event_info.detach_reader()
 
         # misc / final cleanup
         self.breakpoints.reset()
         #self.reader.close()
+
+        #
+        # drop every piece of per-trace navigation state: history, bookmarks
+        # and the occurrence index all describe the trace we just closed,
+        # and must not leak into the next one (or sit around holding a
+        # reference to a dead reader)
+        #
+        if self.history:
+            self.history.reset()
+        if self.bookmarks:
+            self.bookmarks.clear()
+        self._occurrence_index = None
 
         self.reader = None
 
@@ -265,6 +456,7 @@ class TenetContext(object):
         """
         import ida_kernwin
         self.registers.show(position=ida_kernwin.DP_RIGHT)
+        self.event_info.show("CPU Registers", ida_kernwin.DP_TAB)
         self.tree.show("CPU Registers", ida_kernwin.DP_BOTTOM)
         #self.breakpoints.dockable.set_dock_position("CPU Registers", ida_kernwin.DP_BOTTOM)
         #self.breakpoints.dockable.show()
@@ -385,7 +577,7 @@ class TenetContext(object):
         """
         Handle a trace reader event indicating that the current IDX has changed.
 
-        This will make the disassembler track with the PC/IP of the trace reader. 
+        This will make the disassembler track with the PC/IP of the trace reader.
         """
         dctx = disassembler[self]
 
@@ -398,14 +590,34 @@ class TenetContext(object):
         bin_address = self.reader.rebased_ip
 
         #
+        # one line per step, showing every number involved in deciding where
+        # the disassembler ends up. this is the single most useful diagnostic
+        # for "stepping does nothing": it separates "the offset did not map"
+        # from "we jumped, but to an unmapped address"
+        #
+        # (mapped is computed once and reused: this runs on every scrub step,
+        # and evaluating it only for a disabled debug call would tax the
+        # exact path that has to stay fast)
+        #
+        mapped = dctx.is_mapped(bin_address)
+        pdbg("step idx=%d ip=%s off=%s -> rebased=%s mapped=%s",
+             idx,
+             self.reader.ip and f"{self.reader.ip:#x}",
+             self.reader.offset and f"{self.reader.offset:#x}",
+             bin_address and f"{bin_address:#x}",
+             mapped)
+
+        #
         # if the code address is in a library / other unknown area that
         # cannot be renedered by the disassembler, then resolve the last
         # known trace 'address' within the database
         #
 
-        if not dctx.is_mapped(bin_address):
+        if not mapped:
             last_good_idx = self.reader.analysis.get_prev_mapped_idx(idx)
             if last_good_idx == -1:
+                pdbg("step: %s is unmapped and no earlier event maps either; "
+                     "not navigating", bin_address and f"{bin_address:#x}")
                 return # navigation is just not gonna happen...
 
             # fetch the last instruction pointer to fall within the trace
@@ -413,10 +625,180 @@ class TenetContext(object):
 
             # convert the trace-based instruction pointer to one that maps to the disassembler
             bin_address = self.reader.analysis.rebase_pointer(last_good_trace_address)
+            pdbg("step: falling back to idx=%d -> %s", last_good_idx,
+                 bin_address and f"{bin_address:#x}")
 
         # navigate the disassembler to a 'suitable' address based on the trace idx
+        pdbg("step: navigating to %s", bin_address and f"{bin_address:#x}")
         dctx.navigate(bin_address)
         disassembler.refresh_views()
+
+        #
+        # remember where we have been (bounded, and deduplicated) so the
+        # user can step back out of a deep dive without retracing it.
+        # suppressed while we ourselves are walking the history.
+        #
+        if self.history and not self._suppress_history:
+            self.history.record(idx)
+
+    #-------------------------------------------------------------------------
+    # Secondary Navigation
+    #-------------------------------------------------------------------------
+
+    def _navigate_history(self, direction):
+        """
+        Step through the navigation history ('back' / 'forward').
+
+        Returns the index moved to, or None when there is nowhere to go.
+        """
+        if not self.history:
+            return None
+
+        idx = self.history.back() if direction < 0 else self.history.forward()
+        if idx is None:
+            pmsg("No more history in that direction")
+            return None
+
+        #
+        # the seek fires _idx_changed, which records the new position in the
+        # history -- that would truncate the forward stack we are walking.
+        # suppressing the record for exactly this one seek keeps back/forward
+        # behaving like a browser.
+        #
+        self._suppress_history = True
+        try:
+            self.reader.seek(idx)
+        finally:
+            self._suppress_history = False
+
+        return idx
+
+    def interactive_history_back(self):
+        return self._navigate_history(-1)
+
+    def interactive_history_forward(self):
+        return self._navigate_history(+1)
+
+    def interactive_toggle_bookmark(self):
+        """
+        Add / remove a bookmark at the current trace position.
+        """
+        if not self.bookmarks:
+            return False
+
+        idx = self.reader.idx
+        name = str(idx)
+
+        if name in self.bookmarks:
+            self.bookmarks.remove(name)
+            pmsg(f"Removed bookmark at idx {idx:,}")
+            return False
+
+        self.bookmarks.add(name, idx)
+        pmsg(f"Added bookmark at idx {idx:,}")
+        return True
+
+    def interactive_next_bookmark(self):
+        """
+        Seek to the next bookmark in idx order.
+        """
+        return self._seek_bookmark(+1)
+
+    def interactive_prev_bookmark(self):
+        """
+        Seek to the previous bookmark in idx order.
+        """
+        return self._seek_bookmark(-1)
+
+    def _seek_bookmark(self, direction):
+        if not self.bookmarks:
+            return None
+
+        positions = sorted(position for _, position in self.bookmarks.items())
+        if not positions:
+            pmsg("No bookmarks set")
+            return None
+
+        current = self.reader.idx
+
+        if direction > 0:
+            target = next((p for p in positions if p > current), positions[0])
+        else:
+            target = next((p for p in reversed(positions) if p < current),
+                          positions[-1])
+
+        self.reader.seek(target)
+        return target
+
+    def interactive_next_occurrence(self):
+        """
+        Seek to the next execution of the current address.
+        """
+        return self._seek_occurrence(+1)
+
+    def interactive_prev_occurrence(self):
+        """
+        Seek to the previous execution of the current address.
+        """
+        return self._seek_occurrence(-1)
+
+    def _seek_occurrence(self, direction):
+        index = self.occurrence_index
+        if index is None:
+            pmsg("Occurrence index unavailable")
+            return None
+
+        #
+        # key off the module offset when the event has one -- it is the
+        # primary navigation key and survives across ASLR; otherwise fall
+        # back to the rebased database address
+        #
+        idx = self.reader.idx
+        key = self.reader.get_offset(idx)
+        if key is None:
+            key = self.reader.rebased_ip
+            if key is None:
+                return None
+
+        if direction > 0:
+            target = index.next_occurrence(key, idx)
+        else:
+            target = index.prev_occurrence(key, idx)
+
+        if target is None:
+            pmsg(f"No more executions of 0x{key:X}")
+            return None
+
+        self.reader.seek(target)
+        return target
+
+    def interactive_seek_address(self):
+        """
+        Prompt for an address (or offset) and seek to its first execution.
+        """
+        import ida_kernwin
+
+        if not self.occurrence_index:
+            return None
+
+        prompt = "Address (0x...) or module offset"
+        text = ida_kernwin.ask_str("", 16, prompt)
+        if not text:
+            return None
+
+        try:
+            key = int(text, 0)
+        except ValueError:
+            pmsg(f"'{text}' is not a valid number")
+            return None
+
+        target = self.occurrence_index.occurrences(key)
+        if not target:
+            pmsg(f"No executions of 0x{key:X}")
+            return None
+
+        self.reader.seek(target[0])
+        return target[0]
 
     def _select_trace_file(self):
         """
@@ -429,11 +811,16 @@ class TenetContext(object):
             self._last_directory = disassembler[self].get_database_directory()
 
         # create & configure a Qt File Dialog for immediate use
+        #
+        # both extensions are advertised: .frinet carries per-event offsets
+        # (precise pseudocode sync), .tenet is the legacy format that the
+        # plugin still reads (addressing then falls back to the ASLR slide)
+        #
         file_dialog = QtWidgets.QFileDialog(
             None,
             'Open trace file',
             self._last_directory,
-            'All Files (*.*)'
+            'Tenet / FRINET traces (*.frinet *.tenet);;All Files (*.*)'
         )
         file_dialog.setFileMode(QtWidgets.QFileDialog.ExistingFiles)
 

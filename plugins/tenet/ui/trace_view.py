@@ -1293,7 +1293,7 @@ class TraceView(QtWidgets.QWidget):
         """
         Handle a right click event (populate/show context menu).
         """
-        action = self._menu.exec_(self.mapToGlobal(position))
+        action = run_exec(self._menu, self.mapToGlobal(position))
         if action == self._action_load:
             self.pctx.interactive_load_trace(True)
         elif action == self._action_close:

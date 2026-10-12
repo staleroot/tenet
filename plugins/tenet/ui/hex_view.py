@@ -590,7 +590,7 @@ class HexView(QtWidgets.QAbstractScrollArea):
         # show the right click context menu
         #
 
-        action = menu.exec_(self.mapToGlobal(position))
+        action = run_exec(menu, self.mapToGlobal(position))
         if not action:
             return
 

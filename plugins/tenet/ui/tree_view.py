@@ -6,11 +6,42 @@ import sys
 import ida_kernwin
 import ida_funcs
 
-from PyQt5.QtWidgets import *
-from PyQt5.QtGui import *
-from PyQt5.QtCore import *
-from tenet.util.qt import QT_AVAILABLE
+from tenet.util.qt import *
+from tenet.util.qt import qt_class
 from tenet.integration.api import DockableWindow
+
+#
+# IDA 9.2 moved to Qt6/PySide6 and older builds ship Qt5/PyQt5, so the Qt
+# classes are taken from whichever binding the shim resolved instead of
+# hardcoding PyQt5 (which, on a Qt6 IDA, either fails to import outright or
+# trips IDA's "enable PyQt5 shims?" prompt).
+#
+# They used to arrive here via three star imports; qt_class() searches
+# QtWidgets, QtGui and QtCore instead of anyone guessing which module a
+# class lives in -- QStandardItem/QStandardItemModel, for example, are
+# QtGui classes, not QtWidgets ones.
+#
+if not QT_AVAILABLE:
+    raise ImportError(
+        "Tenet requires a Qt binding (PySide6, PyQt5 or PySide2)")
+
+QBrush = qt_class("QBrush")
+QColor = qt_class("QColor")
+QHeaderView = qt_class("QHeaderView")
+QMenu = qt_class("QMenu")
+QStandardItem = qt_class("QStandardItem")
+QStandardItemModel = qt_class("QStandardItemModel")
+#
+# Qt is not a widget class but the enum namespace (Qt.CustomContextMenu and
+# friends); it used to arrive from the old ``from PyQt5.QtCore import *``,
+# so it needs an alias here too or every bare ``Qt.<enum>`` raises NameError
+# at runtime -- long after the import succeeded.
+#
+Qt = qt_class("Qt")
+QTreeView = qt_class("QTreeView")
+QVBoxLayout = qt_class("QVBoxLayout")
+QWidget = qt_class("QWidget")
+
 # TODO: clean :)
 sys.setrecursionlimit(100000)
 
@@ -175,7 +206,7 @@ class CallTreeView(QWidget):
         """
         Handle a right click event (populate/show context menu).
         """
-        action = self.menu.exec_(self.mapToGlobal(position))
+        action = run_exec(self.menu, self.mapToGlobal(position))
         if action == self.action_expand:
             self.tree.expandAll()
         elif action == self.action_collapse:

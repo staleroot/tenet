@@ -23,6 +23,13 @@ import ida_ida   # for 9.+
 import ida_diskio
 import ida_kernwin
 import ida_segment
+#
+# idaapi (the umbrella module) supplies the COLOR_* tag constants that
+# lex_citem_indexes() scrapes out of the decompiler's raw text; it is not
+# re-exported by any of the ida_* modules imported above, so referencing it
+# without this import is a latent NameError.
+#
+import idaapi
 
 from .api import DisassemblerCoreAPI, DisassemblerContextAPI
 from ...util.qt import *
@@ -63,6 +70,80 @@ def execute_sync(function, sync_type):
         # return the output of the synchronized execution
         return output[0]
     return wrapper
+
+#
+# IDA exposes several spellings of the TWidget/Python-form bridge and they
+# are NOT interchangeable:
+#
+#   TWidgetToQtPythonWidget  (9.2+)  binding-agnostic. Tries shiboken6 +
+#                                    PySide6 and falls back to PyQt5's sip.
+#                                    This is the spelling Hex-Rays recommends
+#                                    when the others misbehave.
+#   TWidgetToPyQtWidget              an alias of the above on 9.2+; the
+#                                    original implementation on <= 9.1.
+#   TWidgetToPySideWidget    (9.2+)  BROKEN when called from a plugin. It
+#                                    does ctx.QtGui.QWidget.FromCapsule(tw)
+#                                    with ctx defaulting to
+#                                    sys.modules['__main__'] -- and inside a
+#                                    plugin that is the plugin module, which
+#                                    has no QtGui. Confirmed still broken in
+#                                    IDA 9.4 (community thread #560).
+#
+# So the binding-agnostic spelling is tried first and the rest are fallbacks.
+# Because the difference between them is runtime behaviour rather than
+# anything visible on the class, each candidate is *called* and a failure
+# falls through to the next instead of aborting.
+#
+_PYTHON_WIDGET_BRIDGES = {
+    "twidget": ("TWidgetToQtPythonWidget", "TWidgetToPyQtWidget",
+                "TWidgetToPySideWidget"),
+    "form":    ("FormToPyQtWidget", "FormToQtPythonWidget",
+                "FormToPySideWidget"),
+}
+
+def _python_widget_bridge(kind, source):
+    """
+    Cast an IDA ``TWidget`` (or a plugin form) to a real Qt widget.
+
+    ``kind`` is ``"twidget"`` or ``"form"``. Every candidate converter is
+    tried in turn: IDA ships more than one spelling and only some of them
+    work when called from a plugin, which cannot be told apart by name. If
+    none succeeds the error names each attempt and its failure, so a future
+    IDA API change is diagnosable from the message alone.
+    """
+    #
+    # a None twidget has no pointer to convert; IDA's own PySide converter
+    # returns None here, and the others raise something unhelpful
+    #
+    if source is None:
+        return None
+
+    names = _PYTHON_WIDGET_BRIDGES[kind]
+    plugin_form = ida_kernwin.PluginForm
+    failures = []
+
+    for name in names:
+        converter = getattr(plugin_form, name, None)
+        if converter is None:
+            failures.append("%s: not exposed" % name)
+            continue
+
+        try:
+            return converter(source)
+        except Exception as exc:
+            failures.append("%s: %s: %s" % (name, type(exc).__name__, exc))
+
+    raise RuntimeError(
+        "ida_kernwin.PluginForm could not convert %s to a Qt widget; "
+        "tried %s" % (kind, "; ".join(failures)))
+
+def twidget_to_qt(twidget):
+    """Cast an IDA ``TWidget*`` to the binding's ``QWidget``."""
+    return _python_widget_bridge("twidget", twidget)
+
+def form_to_qt(form):
+    """Cast an IDA plugin form to the binding's ``QWidget``."""
+    return _python_widget_bridge("form", form)
 
 #------------------------------------------------------------------------------
 # Disassembler Core API (universal)
@@ -132,7 +213,14 @@ class IDACoreAPI(DisassemblerCoreAPI):
 
         # get the viewer's qt widget
         viewer_twidget = viewer.GetWidget()
-        viewer_widget = ida_kernwin.PluginForm.TWidgetToPyQtWidget(viewer_twidget)
+        viewer_widget = twidget_to_qt(viewer_twidget)
+
+        #
+        # a head-less (batch) session has no widget to borrow a colour from;
+        # say so rather than crashing on a None
+        #
+        if viewer_widget is None:
+            return None
 
         # fetch the background color property
         #viewer.Show() # TODO: re-enable!
@@ -165,7 +253,7 @@ class IDACoreAPI(DisassemblerCoreAPI):
         twidget = ida_kernwin.create_empty_widget(window_title)
 
         # cast the IDA 'twidget' as a Qt widget for use
-        dockable = ida_kernwin.PluginForm.TWidgetToPyQtWidget(twidget)
+        dockable = twidget_to_qt(twidget)
         layout = dockable.layout()
         layout.addWidget(widget)
 
@@ -244,6 +332,100 @@ class IDAContextAPI(DisassemblerContextAPI):
 
     def is_mapped(self, address):
         return ida_bytes.is_mapped(address)
+
+    def is_code_address(self, address):
+        """
+        Return True when the given address is a defined instruction.
+        """
+        try:
+            return bool(ida_bytes.is_code(ida_bytes.get_flags(address)))
+        except Exception:
+            return False
+
+    def get_segments(self):
+        """
+        Return the layout of every segment of the open database.
+
+        Used by FRINET to resolve where `off == 0` (the runtime module base)
+        maps to. The *file position* of each segment is what makes this work
+        for ELF/Android databases where the nominal imagebase and the real
+        module origin differ.
+        """
+        from ...trace.addressing import SegmentInfo
+
+        segments = []
+
+        for seg_start in idautils.Segments():
+            seg = ida_segment.getseg(seg_start)
+            if seg is None:
+                continue
+
+            start_ea = int(seg.start_ea)
+            end_ea = int(seg.end_ea)
+            if end_ea <= start_ea:
+                continue
+
+            try:
+                name = ida_segment.get_segm_name(seg)
+            except Exception:
+                name = ""
+
+            perm = int(getattr(seg, "perm", 0) or 0)
+            executable = bool(perm & ida_segment.SEGPERM_EXEC)
+
+            # -1 when the loader does not tell us where the segment is in
+            # the input file (SegmentInfo then yields no origin at all)
+            filepos = getattr(seg, "filepos", -1)
+            try:
+                filepos = int(filepos)
+            except (TypeError, ValueError):
+                filepos = -1
+
+            segments.append(SegmentInfo(
+                name=name,
+                start=start_ea,
+                end=end_ea,
+                filepos=filepos,
+                executable=executable,
+            ))
+
+        return segments
+
+    def confirm_offset_origin(self, candidates):
+        """
+        Ask the user to confirm the module origin when it is ambiguous.
+
+        Returns the confirmed :class:`OriginCandidate`, or None when the
+        user cancels (FRINET then falls back to the legacy translation
+        instead of guessing).
+        """
+        if not candidates:
+            return None
+
+        best = candidates[0]
+        lines = [
+            "The trace module origin (address of off=0) is ambiguous in",
+            "this database. Pick the candidate to map the trace to:",
+            "",
+        ]
+        for index, candidate in enumerate(candidates[:8], 1):
+            marker = "->" if index == 1 else "  "
+            lines.append(f"{marker} {index}. {candidate.describe()}")
+        if len(candidates) > 8:
+            lines.append(f"     ... and {len(candidates) - 8} more")
+        lines.append("")
+        lines.append(f"Use candidate #1?")
+
+        try:
+            answer = ida_kernwin.ask_yn(
+                ida_kernwin.ASKBTN_YES,
+                "\n".join(lines),
+            )
+        except Exception as exc:
+            logger.warning(f"Offset origin prompt failed: {exc}")
+            return None
+
+        return best if answer == ida_kernwin.ASKBTN_YES else None
 
     def get_next_insn(self, address):
 
@@ -510,7 +692,7 @@ class DockableWindow(ida_kernwin.PluginForm):
 
     def OnCreate(self, form):
         #print("Creating", self.title)
-        self.parent = self.FormToPyQtWidget(form)
+        self.parent = form_to_qt(form)
 
         layout = QtWidgets.QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)

@@ -14,6 +14,7 @@ from tenet.core import TenetCore
 from tenet.types import BreakpointEvent
 from tenet.context import TenetContext
 from tenet.util.misc import register_callback, notify_callback, is_plugin_dev
+from tenet.util.log import DEBUG_ENABLED, pdbg
 from tenet.util.qt import *
 
 logger = logging.getLogger("Tenet.IDA.Integration")
@@ -44,6 +45,14 @@ class TenetIDA(TenetCore):
         #
 
         self._hooked = False
+
+        #
+        # last (idx, address) reported by the disassembly repaint hook. the
+        # hook runs on every screen update, so a diagnostic is only emitted
+        # when the answer actually changes -- otherwise one paint would bury
+        # every other message in the output window.
+        #
+        self._last_highlight_debug = None
         
         self._ui_hooks = UIHooks()
         self._ui_hooks.get_lines_rendering_info = self._render_lines
@@ -324,7 +333,7 @@ class TenetIDA(TenetCore):
 
             # prep for some shady hacks
             p_qmenu = ctypes.cast(int(popup), ctypes.POINTER(ctypes.c_void_p))[0]
-            qmenu = sip.wrapinstance(int(p_qmenu), QtWidgets.QMenu)
+            qmenu = wrapinstance(int(p_qmenu), QtWidgets.QMenu)
 
             #
             # inject and organize the Tenet plugin actions
@@ -406,7 +415,21 @@ class TenetIDA(TenetCore):
         ctx = self.get_context(IDA_GLOBAL_CTX)
         if not ctx.reader:
             return
-        
+
+        #
+        # the repaint hook is the last link in the chain: if it never fires,
+        # nothing can be drawn no matter how the addresses resolve. it runs on
+        # every paint, so report only when the answer changes.
+        #
+        if DEBUG_ENABLED:
+            debug_state = (ctx.reader.idx, ctx.reader.rebased_ip)
+            if debug_state != self._last_highlight_debug:
+                self._last_highlight_debug = debug_state
+                pdbg("paint: hook fired, idx=%d current=%s mapped=%s",
+                     debug_state[0],
+                     debug_state[1] and f"{debug_state[1]:#x}",
+                     ida_bytes.is_mapped(debug_state[1]))
+
         trail_length = 6
 
         forward_color = self.palette.trail_forward

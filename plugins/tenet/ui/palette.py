@@ -482,9 +482,26 @@ class PluginPalette(object):
     def _refresh_theme_hints(self):
         """
         Peek at the UI context to infer what kind of theme the user might be using.
+
+        Both hints are best-effort cosmetics, so neither is allowed to be
+        fatal. They reach through IDA's Qt bridge, which does not exist in
+        every situation (a head-less session, an IDA build whose bridge
+        behaves differently, a widget that has not been created yet) -- and
+        a plugin must still load a trace when all it cannot do is pick a
+        colour scheme.
         """
-        self._user_qt_hint = self._qt_theme_hint()
-        self._user_disassembly_hint = self._disassembly_theme_hint() or "dark"
+        self._user_qt_hint = self._hint_or_none(self._qt_theme_hint, "qt")
+        self._user_disassembly_hint = (
+            self._hint_or_none(self._disassembly_theme_hint, "disassembly") or "dark")
+
+    def _hint_or_none(self, hint, label):
+        """Run a theme hint, degrading to None if it raises."""
+        try:
+            return hint()
+        except Exception as exc:
+            logger.debug(" - Failed to infer %s theme hint (%s: %s); using default",
+                         label, type(exc).__name__, exc)
+            return None
 
     def _disassembly_theme_hint(self):
         """

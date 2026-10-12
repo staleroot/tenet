@@ -3,7 +3,17 @@ import struct
 import logging
 
 from tenet.types import BreakpointType
-from tenet.util.log import pmsg
+
+#
+# `tenet.util.log` needs the disassembler; tolerate its absence so traces
+# can be loaded (and tested) head-less.
+#
+
+try:
+    from tenet.util.log import pmsg
+except Exception:  # pragma: no cover - outside of IDA
+    pmsg = print
+
 from tenet.util.misc import register_callback, notify_callback
 from tenet.trace.file import TraceFile
 from tenet.trace.types import TraceMemory
@@ -87,8 +97,44 @@ class TraceReader(object):
     def rebased_ip(self):
         """
         Return a rebased version of the current instruction pointer (if available).
+
+        FRINET traces carry an explicit module offset per event: when the
+        analysis resolved the module origin, the offset is the primary
+        navigation key (``static_ea = idb_module_start + off``) and the
+        legacy ASLR heuristic is only used as a fallback for events without
+        an offset, or when the origin could not be resolved.
         """
+        offset = self.get_offset(self.idx)
+        if offset is not None:
+            static_ea = self.analysis.translate_offset(offset)
+            if static_ea is not None:
+                return static_ea
+
         return self.analysis.rebase_pointer(self.ip)
+
+    @property
+    def offset(self):
+        """
+        Return the FRINET module offset of the current event (or None).
+        """
+        return self.get_offset(self.idx)
+
+    @property
+    def has_offsets(self):
+        """
+        Return True when the loaded trace carries `off=` fields at all.
+        """
+        return bool(getattr(self.trace, "has_offsets", False))
+
+    def get_offset(self, idx):
+        """
+        Return the FRINET module offset for the given timestamp, or None.
+
+        None means "this event cannot be mapped into the database with an
+        offset": either a legacy trace, or an event that executed outside
+        of the traced module.
+        """
+        return self.trace.get_off(idx)
 
     @property
     def sp(self):

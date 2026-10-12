@@ -55,19 +55,32 @@ import collections
 
 try:
     from tenet.util.log import pmsg
+
+#
+# `tenet.util.log` pulls in the disassembler API shim, which does not exist
+# outside of IDA. when loading/processing traces standalone (tools, tests),
+# fall back to a plain print.
+#
+
+except Exception:
+    pmsg = print
+
+#
+# trace primitives are disassembler independent: try the absolute plugin
+# paths first, then the package-relative ones (same file, different loader),
+# and finally the historical 'standalone script' layout.
+#
+
+try:
     from tenet.trace.arch import ArchAMD64, ArchX86, ArchARM, ArchARM64
     from tenet.trace.types import TraceMemory
-
-#
-# this script can technically be run in a standalone mone to process / digest
-# a trace outside of a disassembler / the normal integration. so if the above
-# fails, use the following imports to operate independently
-#
-
 except ImportError:
-    from arch import ArchAMD64, ArchX86, ArchARM, ArchARM64
-    from .types import TraceMemory 
-    pmsg = print
+    try:
+        from .arch import ArchAMD64, ArchX86, ArchARM, ArchARM64
+        from .types import TraceMemory
+    except ImportError:
+        from arch import ArchAMD64, ArchX86, ArchARM, ArchARM64
+        from types import TraceMemory
 
 #-----------------------------------------------------------------------------
 # Definitions
@@ -98,6 +111,15 @@ DEFAULT_COMPRESSION = zipfile.ZIP_DEFLATED
 DEFAULT_SEGMENT_LENGTH = USHRT_MAX
 REG_OFFSET_CACHE_SIZE = 16
 REG_OFFSET_CACHE_INTERVAL = 4096
+
+#
+# header / metadata fields that are *not* events. the FRINET header is a
+# single `slide=0x...` line, older traces may also carry `module=`/`func=`
+# lines; they must never be mistaken for an instruction.
+#
+TRACE_HEADER_FIELDS = frozenset((
+    "SLIDE", "MODULE", "FUNC", "ARCH", "FORMAT", "VERSION",
+))
 
 #-----------------------------------------------------------------------------
 # Utils
@@ -230,6 +252,13 @@ class TraceFile(object):
 
         # ASLR slide if present in file
         self.slide = None
+
+        #
+        # FRINET: True when at least one event carries an `off=` field.
+        # navigation prefers offsets when this is set, and falls back to
+        # the legacy ASLR heuristics when it is not.
+        #
+        self.has_offsets = False
 
         # a sorted array of all unique PC / IP (eg, EIP, or RIP) that appear in the trace
         self.ip_addrs = None
@@ -663,6 +692,55 @@ class TraceFile(object):
             raise ValueError("Invalid IDX %u" % idx)
         return seg.get_ip(idx)
 
+    def get_off(self, idx):
+        """
+        Return the FRINET module offset (`off`) for the given timestamp.
+
+        Returns ``None`` when the event carries no offset: legacy ``.tenet``
+        traces have none, and FRINET events that executed outside of the
+        traced module (libc, linker, ...) intentionally omit it.
+        """
+        seg = self.get_segment(idx)
+        if not seg:
+            raise ValueError("Invalid IDX %u" % idx)
+        return seg.get_off(idx)
+
+    def sample_offsets(self, max_samples=4096, max_scan=250_000):
+        """
+        Return a bounded sample of the distinct module offsets of this trace.
+
+        Used to validate the trace module origin against the database (see
+        ``tenet.trace.addressing``). Bounded so a 10M event trace is never
+        fully scanned here.
+        """
+        if not self.has_offsets or self.length <= 0:
+            return []
+
+        samples, seen = [], set()
+
+        def collect(idx):
+            off = self.get_off(idx)
+            if off is None or off in seen:
+                return
+            seen.add(off)
+            samples.append(off)
+
+        # evenly spaced pass over the whole trace
+        stride = max(1, self.length // max_samples)
+        for idx in range(0, self.length, stride):
+            collect(idx)
+            if len(samples) >= max_samples:
+                return samples
+
+        # nothing hit? fall back to a bounded linear scan
+        if not samples:
+            for idx in range(0, min(self.length, max_scan)):
+                collect(idx)
+                if len(samples) >= max_samples:
+                    break
+
+        return samples
+
     def get_mapped_ip(self, ip):
         """
         Return the 'mapped' (compressed) id for the given instruction address.
@@ -1031,6 +1109,15 @@ class TraceSegment(object):
         self.base_idx = base_idx
         self.length = 0
 
+        #
+        # FRINET: per-event module offset (`off=0x...`, relative to the
+        # runtime module base). -1 means "this event has no offset" (an
+        # event that executed outside of the traced module, or a legacy
+        # .tenet trace that has no offsets at all). None means "the segment
+        # was loaded from a packed trace, which does not store offsets".
+        #
+        self.offs = None
+
         self.reg_data = None
         self.reg_masks = None
 
@@ -1137,6 +1224,11 @@ class TraceSegment(object):
         # ip storage
         self.ips = [0 for x in range(self.trace.segment_length)]
 
+        #
+        # FRINET module offset storage (-1 == no offset for this event)
+        #
+        self.offs = [-1 for x in range(self.trace.segment_length)]
+
         # register storage (minus IP)
         MAX_REG_DATA = self.trace.arch.POINTER_SIZE * len(self.trace.arch.REGISTERS) * self.trace.segment_length
         self.reg_data = bytearray(MAX_REG_DATA)
@@ -1167,7 +1259,26 @@ class TraceSegment(object):
         """
         relative_idx = idx - self.base_idx
         return self.trace.ip_addrs[self.ips[relative_idx]]
-    
+
+    def get_off(self, idx):
+        """
+        Return the FRINET module offset for the given timestamp, or None.
+
+        ``-1`` is the internal "this event has no offset" marker (see
+        ``TraceSegment.__init__``), it is never exposed to callers. Packed
+        traces (``offs is None``) do not store offsets at all.
+        """
+        offs = self.offs
+        if offs is None:
+            return None
+
+        relative_idx = idx - self.base_idx
+        if relative_idx < 0 or relative_idx >= len(offs):
+            return None
+
+        off = offs[relative_idx]
+        return None if off < 0 else off
+
     def get_reg_delta(self, idx):
         """
         Return the register delta for the given timestamp.
@@ -1662,79 +1773,134 @@ class TraceSegment(object):
     def _process_lines(self, lines):
         """
         Process text lines from a delta reg/mem trace.
+
+        A malformed line is reported and *skipped*: it must never abort the
+        rest of the segment (indexes stay contiguous, following events are
+        not silently dropped).
         """
-        IP = self.trace.arch.IP
         REGISTERS = self.trace.arch.REGISTERS
 
         relative_idx = 0
 
-        try:
+        for line in lines:
 
-            for line in lines:
-                if not self._process_line(line, relative_idx):
-                    continue
+            # ignore blank lines (padding / trailing newline) silently
+            if not line.strip():
+                continue
+
+            try:
+                processed = self._process_line(line, relative_idx)
+
+            except Exception as e:
+                pmsg(f"LINE PARSE FAILED, line ~{self.base_idx+relative_idx:,}, contents '{line}'")
+                pmsg(str(REGISTERS))
+                pmsg(str(e))
+                processed = False
+
+            if processed:
                 relative_idx += 1
-
-        # TODO: pretty gross, but let's just wrap it to make these issues more apparents
-        except Exception as e:
-            pmsg(f"LINE PARSE FAILED, line ~{self.base_idx+relative_idx:,}, contents '{line}'")
-            pmsg(str(REGISTERS))
-            pmsg(str(e))
 
         self.reg_data = bytearray(self.reg_data[:self._reg_offset])
         self.ips = self.ips[:relative_idx]
+        if self.offs is not None:
+            self.offs = self.offs[:relative_idx]
         self.length = relative_idx
 
     def _process_line(self, line, relative_idx):
         """
         Process one line of text from a delta reg/mem trace.
+
+        Returns ``True`` when the line yielded an event (and therefore
+        consumed one trace index), ``False`` when it must be skipped:
+
+        * header / metadata lines (``slide=``, ``module=``, ...),
+        * events without an instruction pointer (they cannot be navigated
+          to, and keeping them would desynchronize every index).
         """
         IP = self.trace.arch.IP
         REGISTERS = self.trace.arch.REGISTERS
-        
-        delta = line.split(",")
-        registers = {}
 
-        # split the state info (registers, memory) into individual items to process
+        delta = line.split(",")
+
+        # header / metadata lines are not events
+        first_field = delta[0].split("=", 1)[0].strip().upper()
+        if first_field in TRACE_HEADER_FIELDS:
+            return False
+
+        registers = {}
+        mem_entries = []
+        ip = None
+        off = None
+
+        #
+        # pass 1: parse (and validate) every field. nothing is written to
+        # the segment buffers until the whole line is known to be usable.
+        #
         for item in delta:
-            name, value = item.split("=")
+
+            if not item:
+                continue
+
+            parts = item.split("=", 1)
+            if len(parts) != 2:
+                raise ValueError(f"Malformed field '{item}' in line '{line}'")
+
+            name, value = parts
             name = name.upper()
 
             # special compression of IP
             if name == IP:
                 ip = int(value, 16)
 
-                try:
-                    mapped_ip = self.trace.ip_map[ip]
-
-                except KeyError:
-                    mapped_ip = len(self.trace.ip_map)
-                    self.trace.ip_map[ip] = mapped_ip
-
-                self.ips[relative_idx] = mapped_ip
+            # FRINET: module offset (`off = pc - slide`)
+            elif name == "OFF":
+                off = int(value, 16)
 
             # GPR
             elif name in REGISTERS:
                 registers[name] = int(value, 16)
 
             # handle memory r/w/rw access
-            elif name in ["MR", "MW", "MRW"]:
-
-                address, hex_data = value.split(":")
-                address = int(address, 16) & 0x00ffffffffffffff
-                hex_data = bytes(hex_data.strip(), 'utf-8')
-                data = binascii.unhexlify(hex_data)
-
-                self.trace.searchable_memory.record_data_for_search(relative_idx+self.base_idx, address, data)
-                self._process_mem_entry(address, data, name, relative_idx)
+            elif name in ("MR", "MW", "MRW"):
+                mem_entries.append((name, value))
 
             elif name == "X29" and "FP" in REGISTERS:
                 registers["FP"] = int(value, 16)
-                
+
             else:
-                print(name)
                 raise ValueError(f"Invalid line in text trace! '{line}' error on '{name}', (value '{value}')")
-        
+
+        #
+        # an event without an instruction pointer is not navigable and
+        # would corrupt the indexes of every event after it: skip it.
+        #
+        if ip is None:
+            return False
+
+        # pass 2: apply -------------------------------------------------------------
+
+        try:
+            mapped_ip = self.trace.ip_map[ip]
+        except KeyError:
+            mapped_ip = len(self.trace.ip_map)
+            self.trace.ip_map[ip] = mapped_ip
+
+        self.ips[relative_idx] = mapped_ip
+
+        if self.offs is not None:
+            self.offs[relative_idx] = -1 if off is None else off
+            if off is not None:
+                self.trace.has_offsets = True
+
+        for access_type, value in mem_entries:
+            address, hex_data = value.split(":")
+            address = int(address, 16) & 0x00ffffffffffffff
+            hex_data = bytes(hex_data.strip(), 'utf-8')
+            data = binascii.unhexlify(hex_data)
+
+            self.trace.searchable_memory.record_data_for_search(relative_idx+self.base_idx, address, data)
+            self._process_mem_entry(address, data, access_type, relative_idx)
+
         self._pack_registers(registers, relative_idx)
 
         return True

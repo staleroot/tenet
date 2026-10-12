@@ -168,7 +168,7 @@ class DisassemblerCoreAPI(object):
         msgbox.setLayout(layout)
 
         # show the dialog
-        msgbox.exec_()
+        run_exec(msgbox)
 
     @abc.abstractmethod
     def message(self, function_address, new_name):
@@ -303,6 +303,36 @@ class DisassemblerContextAPI(object):
         Return the root executable (file) name used to generate the database.
         """
         pass
+
+    #--------------------------------------------------------------------------
+    # FRINET hooks (optional -- defaults keep the legacy behavior)
+    #--------------------------------------------------------------------------
+
+    def get_segments(self):
+        """
+        Return a list of ``tenet.trace.addressing.SegmentInfo`` describing
+        the layout of the open database.
+
+        FRINET needs the real segment layout (start, end and file position)
+        to work out where ``off == 0`` of a traced module lives; without it
+        the legacy ASLR heuristics are used instead.
+        """
+        return []
+
+    def is_code_address(self, address):
+        """
+        Return True when the given address is a defined instruction.
+        """
+        return False
+
+    def confirm_offset_origin(self, candidates):
+        """
+        Confirm an ambiguous FRINET module origin with the user.
+
+        Returns the confirmed candidate, or None to cancel (the trace is
+        then not mapped by offset).
+        """
+        return None
 
     @abc.abstractmethod
     def navigate(self, address, function_address=None):

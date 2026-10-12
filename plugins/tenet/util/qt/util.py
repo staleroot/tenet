@@ -1,12 +1,15 @@
 import sys
 import time
+import logging
 
 from .shim import *
 
-try:
-    from PySide6.QtGui import QClipboard
-except ImportError:
-    from PyQt5.QtGui import QClipboard
+#
+# the clipboard enum lives in QtGui, but which binding it comes from depends
+# on the one the shim resolved (see shim.py) -- never import a binding
+# directly here, or the plugin breaks on any host using a different one.
+#
+QClipboard = QtGui.QClipboard
 
 #------------------------------------------------------------------------------
 # Qt Fonts
@@ -47,7 +50,7 @@ def focus_window():
     mb.setText("Click to take focus...")
     mb.setStandardButtons(QtWidgets.QMessageBox.Ok)
     button = mb.button(QtWidgets.QMessageBox.Ok)
-    mb.exec_()
+    run_exec(mb)
 
 def get_dpi_scale():
     """
@@ -89,3 +92,70 @@ def compute_color_on_gradient(percent, color1, color2):
 
     # return the new color
     return QtGui.QColor(r,g,b)
+
+#------------------------------------------------------------------------------
+# Qt Scheduling
+#------------------------------------------------------------------------------
+
+_logger = logging.getLogger("Tenet.Util.Qt")
+
+
+class QTimerScheduler(object):
+    """
+    Coalesce a burst of callbacks onto one single-shot :class:`QTimer`.
+
+    Navigating a trace fires an index change per step, and a timeline scrub
+    fires dozens per second. Each of those would otherwise open the
+    decompiler, which cannot keep up and does not need to: only the most
+    recent position matters. Restarting one single-shot timer per change
+    means the work runs once, roughly ``delay_ms`` after the *last* change,
+    so scrubbing stays smooth however fast the trace moves.
+
+    This is the scheduler the pseudocode sync controller asks for. It lives
+    here rather than in ``tenet.sync`` on purpose: that package must stay
+    importable, and unit-testable, without any Qt at all.
+
+    Create it on IDA's UI thread -- the plugin does so during init, which is
+    already on that thread -- because that is the thread it fires on.
+    """
+
+    def __init__(self):
+        self._timer = QtCore.QTimer()
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._fire)
+        self._pending = None
+
+    @property
+    def active(self):
+        """Return True while a callback is queued and waiting to run."""
+        return self._pending is not None
+
+    def schedule(self, callback, delay_ms):
+        """
+        Queue ``callback`` to run once, ``delay_ms`` from now.
+
+        Anything previously queued is replaced rather than run. That is the
+        coalescing: a scrub of fifty steps becomes one update, not fifty.
+        """
+        self._pending = callback
+        self._timer.setInterval(int(delay_ms))
+        self._timer.start()
+
+    def cancel(self):
+        """Drop whatever was queued, without running it."""
+        self._pending = None
+        self._timer.stop()
+
+    def _fire(self):
+        callback, self._pending = self._pending, None
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:
+            #
+            # an exception escaping a Qt slot surfaces somewhere far from the
+            # code that caused it, and takes the timer with it -- so report
+            # it where it happened rather than let it vanish into Qt
+            #
+            _logger.exception("scheduled callback %r failed", callback)

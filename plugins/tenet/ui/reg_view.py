@@ -130,15 +130,31 @@ class RegisterArea(QtWidgets.QAbstractScrollArea):
 
         # create actions to show in the context menu
         self._action_copy_value = QtWidgets.QAction("Copy value", None)
+        self._action_toggle_base = QtWidgets.QAction("Display decimal", None)
         self._actions_follow_in_dump = []
         for i in range(tenet.context.NMEM):
             self._actions_follow_in_dump.append(QtWidgets.QAction("Follow in dump "+str(i+1), None))
         self._action_follow_in_disassembly = QtWidgets.QAction("Follow in disassembler", None)
         self._action_clear = QtWidgets.QAction("Clear code breakpoints", None)
 
+        #
+        # the base toggle's label always describes what a click will *do*,
+        # not the current state, so it stays correct after every click
+        #
+        self._refresh_base_action()
+
         # install the right click context menu
         self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._ctx_menu_handler)
+
+    def _refresh_base_action(self):
+        """
+        Sync the 'display base' action label with the model.
+        """
+        if self.model.display_decimal:
+            self._action_toggle_base.setText("Display hexadecimal")
+        else:
+            self._action_toggle_base.setText("Display decimal")
 
     def _init_reg_positions(self):
         """
@@ -216,6 +232,7 @@ class RegisterArea(QtWidgets.QAbstractScrollArea):
             #
 
             menu.addAction(self._action_copy_value)
+            menu.addAction(self._action_toggle_base)
             for i in range(tenet.context.NMEM):
                 menu.addAction(self._actions_follow_in_dump[i])
 
@@ -242,14 +259,22 @@ class RegisterArea(QtWidgets.QAbstractScrollArea):
         # action from the list of visible/active actions
         #
 
-        action = menu.exec_(self.mapToGlobal(position))
+        action = run_exec(menu, self.mapToGlobal(position))
 
         #
         # handle the user selected action
         #
 
         if action == self._action_copy_value:
-            copy_to_clipboard("0x%08X" % reg_value)
+            #
+            # route through the controller so an unavailable register is
+            # never copied as a zero -- it simply copies nothing
+            #
+            if reg_name:
+                self.controller.copy_register_value(reg_name)
+        elif action == self._action_toggle_base:
+            self.controller.toggle_display_format()
+            self._refresh_base_action()
         elif action == self._action_follow_in_disassembly:
             dctx.navigate(reg_value)
         elif action in self._actions_follow_in_dump:
@@ -455,7 +480,7 @@ class RegisterArea(QtWidgets.QAbstractScrollArea):
             if reg_value is None:
                 rendered_value = "?" * reg_nibbles
             else:
-                rendered_value = f'%0{reg_nibbles}X' % reg_value
+                rendered_value = self.model.render_value(reg_value)
 
             # color register if its value changed as a result of T-1 (previous instr)
             if reg_name in self.model.delta_trace:
