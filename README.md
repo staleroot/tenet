@@ -375,10 +375,11 @@ git clone --recursive https://github.com/staleroot/frinet.git
 cd frinet && python3 -m pytest tests/ -q
 ```
 
-312 pass without a Qt binding (313 with PySide6). They cover trace parsing,
-the `.frinet` conversion, address resolution, the synchronisation controller
-and cursor navigation — all with fakes. **They require no IDA, no Qt binding
-and no device, and they claim nothing about a live IDA session.**
+305 pass without a Qt binding (306 with PySide6); the rest skip. They cover
+trace parsing, the `.frinet` conversion, address resolution, the
+synchronisation controller and cursor navigation — all with fakes. **They
+require no IDA, no Qt binding and no device, and they claim nothing about a
+live IDA session.**
 
 Everything that needs a real IDA is covered by a separate manual procedure in
 [`docs/manual-testing.md`](https://github.com/staleroot/frinet/blob/main/docs/manual-testing.md).
