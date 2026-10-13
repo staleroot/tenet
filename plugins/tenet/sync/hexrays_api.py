@@ -925,6 +925,91 @@ def _clone_targets(line, ida_kernwin, handles, attempts):
     return targets
 
 
+#
+# Where in the viewport a jumped-to line is drawn.
+#
+# ``ida_kernwin.jumpto(view, place, x, y)`` takes ``y`` as the row *on screen*
+# at which the target line will be drawn -- the viewer scrolls to
+# ``scroll_top = line - y`` and clamps that against the document. (IDA's own
+# example calls ``self.Jump(v, 0, 5)``, and
+# ``ea_viewer_history_push_and_jump(v, ea, x, y, lnnum)`` takes ``y`` and
+# ``lnnum`` separately, so ``y`` is not a line number.)
+#
+# Passing 0 therefore parks the cursor on the first visible line: no context
+# above it. And because the scroll clamps against the end of the document, the
+# same call parks it on the *last* line when the target is near the bottom --
+# no context below it either. That is exactly the reported symptom, and it is
+# why this is a scroll question rather than a navigation one.
+#
+#: Fraction of the visible height the target line should sit at. 0.5 centres
+#: it, which is the point: context on both sides.
+CENTER_ROW_FRACTION = 0.5
+
+#: Rows used when the widget cannot be measured (no Qt bridge, head-less
+#: host). Strictly positive, so context is shown above the cursor for any pane
+#: taller than this, and -- being a modest value rather than a large one --
+#: never parks a small pane at the bottom.
+FALLBACK_ROW = 12
+FALLBACK_NOTE = "viewport height unmeasured, using y=%d" % FALLBACK_ROW
+
+
+def _viewport_rows(handle):
+    """
+    Visible line count of a custom viewer, or None when it cannot be measured.
+
+    No IDA API reports the height of a viewer in lines, so it is derived from
+    Qt: the widget's pixel height over the font's line pitch. Deliberately
+    lazy and fully guarded -- this runs on every cursor move, and a failure
+    must degrade to the fallback row rather than raise inside a UI callback.
+    """
+    try:
+        from tenet.integration.api.ida_api import twidget_to_qt
+    except Exception:
+        return None
+
+    try:
+        qt = twidget_to_qt(handle)
+    except Exception:
+        return None
+    if qt is None:
+        return None
+
+    try:
+        height = int(qt.height())
+        metrics = qt.fontMetrics()
+        pitch = 0
+        line_spacing = getattr(metrics, "lineSpacing", None)
+        if callable(line_spacing):
+            pitch = int(line_spacing())
+        if pitch <= 0:
+            pitch = int(metrics.height())
+    except Exception:
+        return None
+
+    if height <= 0 or pitch <= 0:
+        return None
+    return max(1, height // pitch)
+
+
+def _centre_row(handle):
+    """
+    ``(row, note)`` -- the screen row to aim for so the line lands mid-viewport.
+
+    ``note`` is non-None only when the height could not be measured, and says
+    so; a silent fallback would make a wrong scroll position impossible to
+    diagnose from the log.
+    """
+    rows = _viewport_rows(handle)
+    if not rows:
+        return FALLBACK_ROW, FALLBACK_NOTE
+
+    row = int(rows * CENTER_ROW_FRACTION)
+    # clamped, not merely halved: a one-line-tall pane has no middle to speak
+    # of, and a row past the last visible line is exactly what put the cursor
+    # at the bottom in the first place
+    return max(0, min(row, rows - 1)), None
+
+
 def _try_jump(ida_kernwin, targets, x, attempts, cache=None):
     """
     One pass over every ``(place, view)`` pairing worth trying.
@@ -933,6 +1018,12 @@ def _try_jump(ida_kernwin, targets, x, attempts, cache=None):
     (False) and an exception are recorded differently, because they are
     different diagnoses: the first means the place class is not the one this
     view takes, the second means the API itself differs on this build.
+
+    Each pairing is tried at the centred row first and at ``y=0`` second, so
+    that a build which rejects (or misreads) a non-zero ``y`` still ends up
+    exactly where it did before this was introduced. The row that landed is
+    part of the returned label, because "it scrolled somewhere unexpected" is
+    not otherwise distinguishable from "it did not scroll".
 
     ``cache``, when given, records the name of the place that worked so the
     caller never has to rediscover it.
@@ -946,20 +1037,200 @@ def _try_jump(ida_kernwin, targets, x, attempts, cache=None):
         columns = [0]
 
     for place_name, place, handle_name, handle in targets:
-        for column in columns:
-            try:
-                if ida_kernwin.jumpto(handle, place, column, 0):
-                    if cache is not None:
-                        cache[0] = place_name
-                    return "jumpto(%s, %s, x=%d)" % (
-                        handle_name, place_name, column)
-            except Exception as exc:
-                _note(attempts, "jumpto(%s, %s): %s: %s"
-                      % (handle_name, place_name,
-                         type(exc).__name__, exc))
+        centre, note = _centre_row(handle)
+        if note:
+            _note(attempts, note)
+
+        # the centred row first, then the proven one; 0 is only appended when
+        # it is not already the plan (a degenerate one-line pane)
+        rows = [centre] if centre else []
+        if 0 not in rows:
+            rows.append(0)
+
+        landed = None
+        for row in rows:
+            for column in columns:
+                try:
+                    ok = ida_kernwin.jumpto(handle, place, column, row)
+                except Exception as exc:
+                    _note(attempts, "jumpto(%s, %s, x=%d, y=%d): %s: %s"
+                          % (handle_name, place_name, column, row,
+                             type(exc).__name__, exc))
+                    # this row is no good here; the y=0 plan still gets its
+                    # turn, which is the whole point of having one
+                    break
+                if ok:
+                    landed = (column, row)
+                    break
+                _note(attempts, "jumpto(%s, %s, x=%d, y=%d) refused"
+                      % (handle_name, place_name, column, row))
+            if landed is not None:
                 break
-            _note(attempts, "jumpto(%s, %s, x=%d) refused"
-                  % (handle_name, place_name, column))
+
+        if landed is not None:
+            if cache is not None:
+                cache[0] = place_name
+            return "jumpto(%s, %s, x=%d, y=%d)" % (
+                handle_name, place_name, landed[0], landed[1])
+    return None
+
+
+def _cursor_row(ida_kernwin, handle):
+    """
+    ``(line, row)`` under the cursor of ``handle``, or None when unreadable.
+
+    Both halves come from the same ``(place, x, y)`` triple the clone route
+    already reads its place from. ``jumpto`` takes ``(place, x, y)`` and this
+    returns ``(place, x, y)``, so the ``y`` read back is where that line was
+    actually drawn -- the only way to *check* where a jump ended up rather
+    than assume it from what was requested.
+
+    Returns None (never raises) for every shape this can come back in: no
+    getter, a bare place instead of a triple, a place that will not downcast.
+    """
+    getter = getattr(ida_kernwin, "get_custom_viewer_place", None)
+    downcast = getattr(ida_kernwin, "place_t_as_simpleline_place_t", None)
+    if not callable(getter) or not callable(downcast):
+        return None
+
+    try:
+        got = getter(handle, False)
+    except Exception:
+        return None
+    if not got or not isinstance(got, (tuple, list)) or len(got) < 3:
+        return None
+
+    try:
+        simple = downcast(got[0].clone())
+    except Exception:
+        return None
+    if simple is None:
+        return None
+
+    try:
+        return int(simple.n), int(got[2])
+    except Exception:
+        return None
+
+
+def _recentre(ida_kernwin, handles, line, x, attempts):
+    """
+    Pull a jump that landed off the middle of the pane back to the middle.
+
+    Returns a bracketed suffix for the log line, or None when there is
+    nothing to add.
+
+    ``jumpto``'s ``y`` is the screen row the line should be drawn at, but the
+    already-visible path *disregards* it -- IDA says as much about the
+    equivalent flag, ``CVNF_LAZY``: "try and move the cursor to a line
+    displaying the place_t if possible. This might disregard the Y position
+    in case of success." So a target that is already on screen moves the
+    cursor and leaves the scroll exactly where it was, which is how a line
+    one row from the top stays one row from the top instead of being
+    centred. A target that is off screen scrolls properly, which is why the
+    two cases behaved differently.
+
+    The correction is a jump to a line just *outside* the viewport whose
+    ``y`` is chosen so the scroll it produces **is** the final scroll: the
+    view then moves once, straight to where it should end up, and the return
+    jump to the target only carries the cursor. Both primes are computed to
+    be provably off screen, and the returned ``y`` is range-checked before
+    it is used -- a prime built from a misread ``y`` must be able to do
+    nothing, not something wrong.
+
+    The cursor is left on ``line`` whatever happens: the prime is attempted
+    only while the cursor is still on ``line``, and if it succeeds the return
+    jump runs through :func:`_try_jump`, which carries its own fallbacks.
+    """
+    for handle_name, handle in handles:
+        rows = _viewport_rows(handle)
+        if not rows:
+            continue
+        desired = max(0, min(int(rows * CENTER_ROW_FRACTION), rows - 1))
+        if desired == 0:
+            continue                    # nothing to centre in a one-line pane
+
+        here = _cursor_row(ida_kernwin, handle)
+        if here is None:
+            return "[row ?]"
+        at_line, row = here
+        if at_line != line:
+            # not the view the jump landed in (or it did not land at all);
+            # correcting here would move a view that was not asked to move
+            continue
+        if row == desired:
+            return "[row %d]" % row
+        if not 0 <= row < rows:
+            _note(attempts, "%s: read-back row %d is outside the %d visible "
+                            "lines, so the scroll is left alone"
+                  % (handle_name, row, rows))
+            return "[row %d]" % row
+
+        #
+        # target scroll = line - desired. Pick the line to prime so that
+        # (prime - prime_y) equals it exactly, while landing outside the
+        # viewport -- which is the only thing that makes jumpto scroll.
+        #
+        if row < desired:
+            prime, prime_y = line - desired, 0
+            if prime < 0:
+                _note(attempts, "line %d cannot be centred: it is within %d "
+                                "lines of the start of its own listing"
+                      % (line, desired))
+                return "[row %d]" % row
+        else:
+            prime, prime_y = line + (rows - row), rows - row + desired
+        if not 0 <= prime_y < rows:
+            _note(attempts, "prime row %d is outside the %d visible lines, "
+                            "so no prime was attempted" % (prime_y, rows))
+            return "[row %d]" % row
+
+        prime_targets = _clone_targets(prime, ida_kernwin,
+                                       [(handle_name, handle)], [])
+        if not prime_targets:
+            _note(attempts, "no place could be built for the prime line %d"
+                  % prime)
+            return "[row %d]" % row
+
+        try:
+            moved = ida_kernwin.jumpto(handle, prime_targets[0][1],
+                                       0, prime_y)
+        except Exception as exc:
+            moved = False
+            _note(attempts, "prime jumpto(%s, line %d, y=%d): %s: %s"
+                  % (handle_name, prime, prime_y, type(exc).__name__, exc))
+        if not moved:
+            _note(attempts, "prime jumpto(%s, line %d, y=%d) refused -- the "
+                            "cursor is still on line %d"
+                  % (handle_name, prime, prime_y, line))
+            return "[row %d]" % row
+
+        # the scroll is final now; all that is left is carrying the cursor
+        # back. _try_jump keeps its column/row fallbacks, so a refusal here
+        # cannot strand the cursor on the prime line -- but if it somehow
+        # does, that is a navigation regression and has to be shouted about
+        # rather than scrolled past.
+        targets = _clone_targets(line, ida_kernwin,
+                                 [(handle_name, handle)], attempts)
+        if not targets or _try_jump(ida_kernwin, targets, x,
+                                    attempts) is None:
+            _note(attempts, "the return to line %d failed after the prime -- "
+                            "the cursor may be stranded on line %d"
+                  % (line, prime))
+            return "[row %d, prime %d y=%d, NO RETURN]" % (row, prime,
+                                                           prime_y)
+
+        after = _cursor_row(ida_kernwin, handle)
+        if after is None:
+            return "[row %d -> ?, prime %d y=%d]" % (row, prime, prime_y)
+        if after[0] != line:
+            _note(attempts, "the cursor is on line %d after the return, not "
+                            "line %d" % (after[0], line))
+        moved_to = after[1]
+        return "[row %d -> %d%s, prime %d y=%d]" % (
+            row, moved_to,
+            "" if moved_to == desired else ", wanted %d" % desired,
+            prime, prime_y)
     return None
 
 
@@ -1071,6 +1342,16 @@ def jump_to_item(vdui, line, x=0, length=1, activate=True, ea=None):
              "; ".join(attempts) or "no strategy to attempt")
         _report_navigation_surface(vdui, ida_kernwin, attempts)
         return False
+
+    #
+    # asked-for row and landed-on row are different facts, and only the
+    # second one is the answer to "is the line in the middle of the pane" --
+    # so it is read back and reported every time, and corrected when it is
+    # not where it was asked to be.
+    #
+    suffix = _recentre(ida_kernwin, handles, line, x, attempts)
+    if suffix:
+        how = "%s %s" % (how, suffix)
 
     if attempts:
         pdbg("pseudocode jump to%s via %s, after: %s", where, how,

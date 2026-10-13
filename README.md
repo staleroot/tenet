@@ -375,7 +375,7 @@ git clone --recursive https://github.com/staleroot/frinet.git
 cd frinet && python3 -m pytest tests/ -q
 ```
 
-305 pass without a Qt binding (306 with PySide6); the rest skip. They cover
+321 pass without a Qt binding (322 with PySide6); the rest skip. They cover
 trace parsing, the `.frinet` conversion, address resolution, the
 synchronisation controller and cursor navigation — all with fakes. **They
 require no IDA, no Qt binding and no device, and they claim nothing about a
